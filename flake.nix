@@ -30,7 +30,7 @@
           fallback;
 
       packageFor = pkgs: pkgs.rustPlatform.buildRustPackage {
-        pname = "typst";
+        pname = "typst-tikz";
         version = rev "00000000";
 
         src = self;

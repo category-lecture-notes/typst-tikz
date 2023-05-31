@@ -1931,36 +1931,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "typst-cli"
-version = "0.4.0"
-dependencies = [
- "atty",
- "chrono",
- "clap",
- "clap_complete",
- "clap_mangen",
- "codespan-reporting",
- "comemo",
- "dirs",
- "elsa",
- "inferno",
- "memmap2",
- "notify",
- "once_cell",
- "open",
- "same-file",
- "siphasher",
- "tempfile",
- "tracing",
- "tracing-error",
- "tracing-flame",
- "tracing-subscriber",
- "typst",
- "typst-library",
- "walkdir",
-]
-
-[[package]]
 name = "typst-library"
 version = "0.4.0"
 source = "git+https://github.com/typst/typst?rev=v0.4.0#f692a5efc62bf95f57d123895b7dce55d2eb9741"
@@ -2003,6 +1973,36 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "typst-tikz"
+version = "0.4.0"
+dependencies = [
+ "atty",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+ "codespan-reporting",
+ "comemo",
+ "dirs",
+ "elsa",
+ "inferno",
+ "memmap2",
+ "notify",
+ "once_cell",
+ "open",
+ "same-file",
+ "siphasher",
+ "tempfile",
+ "tracing",
+ "tracing-error",
+ "tracing-flame",
+ "tracing-subscriber",
+ "typst",
+ "typst-library",
+ "walkdir",
 ]
 
 [[package]]

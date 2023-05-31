@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
-/// typst creates PDF files from .typ files
+/// typst-tikz creates PDF files from .typ files, with TikZ support
 #[derive(Debug, Clone, Parser)]
-#[clap(name = "typst", version = crate::typst_version(), author)]
+#[clap(name = "typst-tikz", version = crate::typst_version(), author)]
 pub struct CliArguments {
     /// Add additional directories to search for fonts
     #[clap(long = "font-path", env = "TYPST_FONT_PATHS", value_name = "DIR", action = ArgAction::Append)]
