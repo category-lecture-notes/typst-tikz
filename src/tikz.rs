@@ -6,9 +6,10 @@ use std::fs::{read, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Error, ErrorKind, Result, Write};
 use std::process::{Command, Output, Stdio};
+use svg_metadata::{Metadata, Unit, Width};
 use tempfile::TempDir;
 
-const REGEX_TIKZPICTURE: &str = r"#tikzpicture\[([^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]";
+const REGEX_PATTERN_TIKZ: &str = r"(?P<environment>tikzpicture|tikzcd)\[(?P<tex_code>[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]";
 
 const LATEX_ENGINE: &str = "lualatex";
 const LATEX_DOCUMENT_BEGIN: &str = r#"
@@ -64,31 +65,6 @@ impl Tikz {
         Ok(Self { tempdir, images: FrozenMap::new() })
     }
 
-    pub fn replace(&self, buffer: &mut String) {
-        lazy_static! {
-            static ref RE: Regex = Regex::new(REGEX_TIKZPICTURE).unwrap();
-        }
-
-        let striped_buffer = RE.replace_all(buffer, |capture: &regex::Captures| {
-            let chunk = capture.get(1).unwrap().as_str();
-
-            let mut hasher = DefaultHasher::new();
-            chunk.to_string().hash(&mut hasher);
-
-            let number = hasher.finish();
-
-            if self.images.get(&number).is_none() {
-                let image = self.invoke_latex(chunk, "tikzpicture").unwrap();
-
-                self.images.insert(number, image);
-            }
-
-            format!(r#"#image("generated_tikz_{}.svg")"#, number)
-        });
-
-        *buffer = striped_buffer.to_string();
-    }
-
     pub fn fetch(&self, name: &str) -> Vec<u8> {
         const PREFIX_SIZE: usize = "generated_tikz_".len();
         const SUFFIX_SIZE: usize = ".svg".len();
@@ -98,7 +74,45 @@ impl Tikz {
         self.images.get(&index).unwrap().to_vec()
     }
 
-    fn invoke_latex(&self, buffer: &str, environment: &str) -> Result<Vec<u8>> {
+    pub fn replace(&self, buffer: &mut String) {
+        lazy_static! {
+            static ref REG_TIKZ: Regex = Regex::new(REGEX_PATTERN_TIKZ).unwrap();
+        }
+
+        let striped_buffer = REG_TIKZ.replace_all(buffer, |capture: &regex::Captures| {
+            let environment = capture.name("environment").unwrap().as_str();
+            let tex_code = capture.name("tex_code").unwrap().as_str();
+
+            let mut hasher = DefaultHasher::new();
+            environment.hash(&mut hasher);
+            tex_code.hash(&mut hasher);
+
+            let hash = hasher.finish();
+
+            if self.images.get(&hash).is_none() {
+                let image = self.invoke_latex(tex_code, environment).unwrap();
+
+                self.images.insert(hash, image);
+            }
+
+            let svg = std::str::from_utf8(self.images.get(&hash).unwrap()).unwrap();
+            let width = match Metadata::parse(svg).unwrap().width.unwrap() {
+                Width { width, unit: Unit::Em } => format!("{}em", width),
+                Width { width, unit: Unit::Pt } => format!("{}pt", width),
+                Width { width, unit: Unit::Cm } => format!("{}cm", width),
+                Width { width, unit: Unit::Mm } => format!("{}mm", width),
+                Width { width, unit: Unit::In } => format!("{}in", width),
+                Width { width, unit: Unit::Percent } => format!("{}%", width),
+                _ => panic!("Unsupported unit"),
+            };
+
+            format!(r#"image("generated_tikz_{}.svg", width: {})"#, hash, width)
+        });
+
+        *buffer = striped_buffer.to_string();
+    }
+
+    fn invoke_latex(&self, tex_code: &str, environment: &str) -> Result<Vec<u8>> {
         let tex_path = self.tempdir.path().join("tikz.tex");
         let pdf_path = self.tempdir.path().join("tikz.pdf");
         let svg_path = self.tempdir.path().join("tikz.svg");
@@ -106,7 +120,7 @@ impl Tikz {
         let mut file = File::create(&tex_path)?;
         writeln!(file, "{}", LATEX_DOCUMENT_BEGIN)?;
         writeln!(file, "\\begin{{{}}}", environment)?;
-        writeln!(file, "{}", buffer)?;
+        writeln!(file, "{}", tex_code.trim())?;
         writeln!(file, "\\end{{{}}}", environment)?;
         writeln!(file, "{}", LATEX_DOCUMENT_END)?;
 
