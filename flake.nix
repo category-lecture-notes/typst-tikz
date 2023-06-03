@@ -65,9 +65,14 @@
           packages = with pkgs; [
             cargo
             clippy
+            pdf2svg
             rust-analyzer
             rustc
             rustfmt
+            (texlive.combine {
+              inherit (pkgs.texlive) scheme-basic
+              luatex85 standalone pgf tikz-cd;
+            })
           ];
 
           buildInputs = optionals pkgs.stdenv.isDarwin [

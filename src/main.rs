@@ -1,4 +1,5 @@
 mod args;
+mod tikz;
 mod trace;
 
 use std::cell::{RefCell, RefMut};
@@ -30,6 +31,7 @@ use typst::World;
 use walkdir::WalkDir;
 
 use crate::args::{CliArguments, Command, CompileCommand};
+use crate::tikz::Tikz;
 use crate::trace::init_tracing;
 
 type CodespanResult<T> = Result<T, CodespanError>;
@@ -169,8 +171,10 @@ fn compile(mut command: CompileSettings) -> StrResult<()> {
         PathBuf::new()
     };
 
+    let tikz = Tikz::new().map_err(|err| err.to_string())?;
+
     // Create the world that serves sources, fonts and files.
-    let mut world = SystemWorld::new(root, &command.font_paths);
+    let mut world = SystemWorld::new(root, &command.font_paths, tikz);
 
     // Perform initial compilation.
     let failed = compile_once(&mut world, &command)?;
@@ -404,6 +408,7 @@ struct SystemWorld {
     paths: RefCell<HashMap<PathHash, PathSlot>>,
     sources: FrozenVec<Box<Source>>,
     main: SourceId,
+    tikz: Tikz,
 }
 
 /// Holds details about the location of a font and lazily the font itself.
@@ -421,7 +426,7 @@ struct PathSlot {
 }
 
 impl SystemWorld {
-    fn new(root: PathBuf, font_paths: &[PathBuf]) -> Self {
+    fn new(root: PathBuf, font_paths: &[PathBuf], tikz: Tikz) -> Self {
         let mut searcher = FontSearcher::new();
         searcher.search(font_paths);
 
@@ -434,6 +439,7 @@ impl SystemWorld {
             paths: RefCell::default(),
             sources: FrozenVec::new(),
             main: SourceId::detached(),
+            tikz,
         }
     }
 }
@@ -457,8 +463,11 @@ impl World for SystemWorld {
             .source
             .get_or_init(|| {
                 let buf = read(path)?;
-                let text = String::from_utf8(buf)?;
-                Ok(self.insert(path, text))
+                let mut text = String::from_utf8(buf)?;
+
+                self.tikz.replace(&mut text);
+
+                Ok(self.insert(path, text.to_string()))
             })
             .clone()
     }
@@ -482,6 +491,12 @@ impl World for SystemWorld {
     }
 
     fn file(&self, path: &Path) -> FileResult<Buffer> {
+        let filename = path.file_name().unwrap().to_str().unwrap();
+
+        if filename.starts_with("generated_tikz_") {
+            return Ok(Buffer::from(self.tikz.fetch(filename)));
+        }
+
         self.slot(path)?
             .buffer
             .get_or_init(|| read(path).map(Buffer::from))
