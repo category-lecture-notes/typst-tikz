@@ -1,7 +1,9 @@
-use elsa::FrozenVec;
+use elsa::FrozenMap;
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{read, File};
+use std::hash::{Hash, Hasher};
 use std::io::{Error, ErrorKind, Result, Write};
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
@@ -37,7 +39,7 @@ const LUA_CONFIG: &str = r#"
 
 pub struct Tikz {
     tempdir: TempDir,
-    images: FrozenVec<Vec<u8>>,
+    images: FrozenMap<u64, Vec<u8>>,
 }
 
 fn execute(cmd: &mut Command) -> Result<()> {
@@ -59,7 +61,7 @@ impl Tikz {
         let mut file = File::create(config_path)?;
         writeln!(file, "{}", LUA_CONFIG)?;
 
-        Ok(Self { tempdir, images: FrozenVec::new() })
+        Ok(Self { tempdir, images: FrozenMap::new() })
     }
 
     pub fn replace(&self, buffer: &mut String) {
@@ -70,10 +72,18 @@ impl Tikz {
         let striped_buffer = RE.replace_all(buffer, |capture: &regex::Captures| {
             let chunk = capture.get(1).unwrap().as_str();
 
-            let image = self.query_tikz(chunk, "tikzpicture").unwrap();
-            self.images.push(image);
+            let mut hasher = DefaultHasher::new();
+            chunk.to_string().hash(&mut hasher);
 
-            format!(r#"#image("generated_tikz_{}.svg")"#, self.images.len() - 1)
+            let number = hasher.finish();
+
+            if self.images.get(&number).is_none() {
+                let image = self.invoke_latex(chunk, "tikzpicture").unwrap();
+
+                self.images.insert(number, image);
+            }
+
+            format!(r#"#image("generated_tikz_{}.svg")"#, number)
         });
 
         *buffer = striped_buffer.to_string();
@@ -83,12 +93,12 @@ impl Tikz {
         const PREFIX_SIZE: usize = "generated_tikz_".len();
         const SUFFIX_SIZE: usize = ".svg".len();
 
-        let index = name[PREFIX_SIZE..name.len() - SUFFIX_SIZE].parse::<usize>().unwrap();
+        let index = name[PREFIX_SIZE..name.len() - SUFFIX_SIZE].parse::<u64>().unwrap();
 
-        self.images.get(index).unwrap().to_vec()
+        self.images.get(&index).unwrap().to_vec()
     }
 
-    fn query_tikz(&self, buffer: &str, environment: &str) -> Result<Vec<u8>> {
+    fn invoke_latex(&self, buffer: &str, environment: &str) -> Result<Vec<u8>> {
         let tex_path = self.tempdir.path().join("tikz.tex");
         let pdf_path = self.tempdir.path().join("tikz.pdf");
         let svg_path = self.tempdir.path().join("tikz.svg");
