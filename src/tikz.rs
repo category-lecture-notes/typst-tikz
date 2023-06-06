@@ -2,12 +2,14 @@ use elsa::FrozenMap;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::fs::{read, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Error, ErrorKind, Result, Write};
 use std::process::{Command, Output, Stdio};
 use svg_metadata::{Metadata, Unit, Width};
 use tempfile::TempDir;
+use typst::diag::{FileError, FileResult};
 
 const REGEX_PATTERN_TIKZ: &str = r"(?P<environment>tikzpicture|tikzcd)\[(?P<tex_code>[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]";
 
@@ -28,13 +30,13 @@ const LUA_CONFIG: &str = r#"
     texconfig.interaction = 1
 
     callback.register('show_error_message', function(...)
-    texio.write_nl('term and log', status.lasterrorstring)
-    texio.write('term', '.\n')
+        texio.write_nl('term and log', status.lasterrorstring)
+        texio.write('term', '.\n')
     end)
 
     callback.register('show_lua_error_hook', function(...)
-    texio.write_nl('term and log', status.lastluaerrorstring)
-    texio.write('term', '.\n')
+        texio.write_nl('term and log', status.lastluaerrorstring)
+        texio.write('term', '.\n')
     end)
 "#;
 
@@ -74,12 +76,14 @@ impl Tikz {
         self.images.get(&index).unwrap().to_vec()
     }
 
-    pub fn replace(&self, buffer: &mut String) {
+    pub fn replace(&self, buffer: &str) -> FileResult<String> {
         lazy_static! {
             static ref REG_TIKZ: Regex = Regex::new(REGEX_PATTERN_TIKZ).unwrap();
         }
 
-        let striped_buffer = REG_TIKZ.replace_all(buffer, |capture: &regex::Captures| {
+        let mut images = VecDeque::new();
+
+        for capture in REG_TIKZ.captures_iter(buffer) {
             let environment = capture.name("environment").unwrap().as_str();
             let tex_code = capture.name("tex_code").unwrap().as_str();
 
@@ -90,7 +94,9 @@ impl Tikz {
             let hash = hasher.finish();
 
             if self.images.get(&hash).is_none() {
-                let image = self.invoke_latex(tex_code, environment).unwrap();
+                let image = self
+                    .invoke_latex(tex_code, environment)
+                    .or(Err(FileError::Other))?;
 
                 self.images.insert(hash, image);
             }
@@ -103,13 +109,18 @@ impl Tikz {
                 Width { width, unit: Unit::Mm } => format!("{}mm", width),
                 Width { width, unit: Unit::In } => format!("{}in", width),
                 Width { width, unit: Unit::Percent } => format!("{}%", width),
-                _ => panic!("Unsupported unit"),
+                _ => return Err(FileError::Other),
             };
 
-            format!(r#"image("generated_tikz_{}.svg", width: {})"#, hash, width)
-        });
+            images.push_back(format!(
+                r#"image("generated_tikz_{}.svg", width: {})"#,
+                hash, width
+            ));
+        }
 
-        *buffer = striped_buffer.to_string();
+        Ok(REG_TIKZ
+            .replace_all(buffer, |_: &regex::Captures| images.pop_front().unwrap())
+            .to_string())
     }
 
     fn invoke_latex(&self, tex_code: &str, environment: &str) -> Result<Vec<u8>> {

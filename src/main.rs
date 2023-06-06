@@ -465,9 +465,9 @@ impl World for SystemWorld {
                 let buf = read(path)?;
                 let mut text = String::from_utf8(buf)?;
 
-                self.tikz.replace(&mut text);
+                text = self.tikz.replace(&text)?;
 
-                Ok(self.insert(path, text.to_string()))
+                Ok(self.insert(path, text))
             })
             .clone()
     }
