@@ -463,11 +463,9 @@ impl World for SystemWorld {
             .source
             .get_or_init(|| {
                 let buf = read(path)?;
-                let mut text = String::from_utf8(buf)?;
+                let text = String::from_utf8(buf)?;
 
-                text = self.tikz.replace(&text)?;
-
-                Ok(self.insert(path, text))
+                Ok(self.insert(path, self.tikz.replace(&text)))
             })
             .clone()
     }
@@ -494,7 +492,12 @@ impl World for SystemWorld {
         let filename = path.file_name().unwrap().to_str().unwrap();
 
         if filename.starts_with("generated_tikz_") {
-            return Ok(Buffer::from(self.tikz.fetch(filename)));
+            return self
+                .tikz
+                .fetch(filename)
+                .as_ref()
+                .map(|f| Buffer::from(f.as_slice()))
+                .or(Err(FileError::Other));
         }
 
         self.slot(path)?
