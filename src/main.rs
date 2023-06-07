@@ -344,11 +344,29 @@ fn print_diagnostics(
     for error in errors {
         // The main diagnostic.
         let range = error.range(world);
-        let diag = Diagnostic::error()
-            .with_message(error.message)
-            .with_labels(vec![Label::primary(error.span.source(), range)]);
 
-        term::emit(&mut w, &config, world, &diag)?;
+        if let Some(id) = Tikz::is_error(world, &error) {
+            let logs = world.tikz.fetch(id).as_ref().unwrap_err().clone();
+
+            let diag = Diagnostic::error()
+                .with_message("failed to compile TikZ figure")
+                .with_notes(logs.split('\n').map(|line| line.to_string()).collect());
+
+            term::emit(&mut w, &config, world, &diag)?;
+
+            let diag = Diagnostic::help()
+                .with_message(error.message)
+                .with_labels(vec![Label::primary(error.span.source(), range)]);
+
+            term::emit(&mut w, &config, world, &diag)?;
+        } else {
+            let range = error.range(world);
+            let diag = Diagnostic::error()
+                .with_message(error.message)
+                .with_labels(vec![Label::primary(error.span.source(), range)]);
+
+            term::emit(&mut w, &config, world, &diag)?;
+        }
 
         // Stacktrace-like helper diagnostics.
         for point in error.trace {
@@ -491,10 +509,10 @@ impl World for SystemWorld {
     fn file(&self, path: &Path) -> FileResult<Buffer> {
         let filename = path.file_name().unwrap().to_str().unwrap();
 
-        if filename.starts_with("generated_tikz_") {
+        if let Some(id) = Tikz::is_filename(filename) {
             return self
                 .tikz
-                .fetch(filename)
+                .fetch(id)
                 .as_ref()
                 .map(|f| Buffer::from(f.as_slice()))
                 .or(Err(FileError::Other));

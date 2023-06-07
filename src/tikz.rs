@@ -9,6 +9,8 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use svg_metadata::{Metadata, Unit, Width};
 use tempfile::TempDir;
+use typst::diag::SourceError;
+use typst::World;
 
 const REGEX_PATTERN_TIKZ: &str = r"(?P<environment>tikzpicture|tikzcd)\[(?P<tex_code>[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]";
 
@@ -39,6 +41,11 @@ const LUA_CONFIG: &str = r#"
     end)
 "#;
 
+const PREFIX: &str = "generated_tikz_";
+const SUFFIX: &str = ".svg";
+const PREFIX_SIZE: usize = PREFIX.len();
+const SUFFIX_SIZE: usize = SUFFIX.len();
+
 pub struct Tikz {
     tempdir: TempDir,
     images: FrozenMap<u64, Box<Result<Vec<u8>, String>>>,
@@ -67,12 +74,7 @@ impl Tikz {
         Ok(Self { tempdir, images: FrozenMap::new() })
     }
 
-    pub fn fetch(&self, name: &str) -> &Result<Vec<u8>, String> {
-        const PREFIX_SIZE: usize = "generated_tikz_".len();
-        const SUFFIX_SIZE: usize = ".svg".len();
-
-        let index = name[PREFIX_SIZE..name.len() - SUFFIX_SIZE].parse::<u64>().unwrap();
-
+    pub fn fetch(&self, index: u64) -> &Result<Vec<u8>, String> {
         self.images.get(&index).unwrap()
     }
 
@@ -105,7 +107,7 @@ impl Tikz {
             };
 
             let Ok(image) = image else {
-                images.push_back(format!(r#"image("generated_tikz_{}.svg")"#, hash));
+                images.push_back(format!(r#"image("{}{}{}")"#, PREFIX, hash, SUFFIX));
                 continue;
             };
 
@@ -121,8 +123,8 @@ impl Tikz {
             };
 
             images.push_back(format!(
-                r#"image("generated_tikz_{}.svg", width: {})"#,
-                hash, width
+                r#"image("{}{}{}", width: {})"#,
+                PREFIX, hash, SUFFIX, width
             ));
         }
 
@@ -159,4 +161,25 @@ impl Tikz {
 
         read(&svg_path).map_err(|err| err.to_string())
     }
+
+    pub fn is_error(world: &dyn World, error: &SourceError) -> Option<u64> {
+        if error.message != "failed to load file" {
+            return None;
+        }
+
+        let range = error.range(world);
+        let source = world.source(error.span.source()).text();
+        let filename = source[range.start + 1..range.end - 1].to_string();
+
+        Tikz::is_filename(&filename)
+    }
+
+    pub fn is_filename(name: &str) -> Option<u64> {
+        if name.starts_with(PREFIX) && name.ends_with(SUFFIX) {
+            name[PREFIX_SIZE..name.len() - SUFFIX_SIZE].parse::<u64>().ok()
+        } else {
+            None
+        }
+    }
+
 }
