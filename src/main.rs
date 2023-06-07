@@ -355,7 +355,7 @@ fn print_diagnostics(
             term::emit(&mut w, &config, world, &diag)?;
 
             let diag = Diagnostic::help()
-                .with_message(error.message)
+                .with_message("the TikZ figure comes from this generated image")
                 .with_labels(vec![Label::primary(error.span.source(), range)]);
 
             term::emit(&mut w, &config, world, &diag)?;

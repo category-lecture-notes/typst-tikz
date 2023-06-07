@@ -26,9 +26,8 @@ const LATEX_DOCUMENT_END: &str = r#"
 "#;
 
 const LUA_CONFIG: &str = r#"
-    texconfig.file_line_error = true
     texconfig.halt_on_error = true
-    texconfig.interaction = 1
+    texconfig.interaction = 0
 
     callback.register('show_error_message', function(...)
         texio.write_nl('term and log', status.lasterrorstring)
