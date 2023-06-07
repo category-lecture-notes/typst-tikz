@@ -47,6 +47,14 @@
         buildInputs = optionals pkgs.stdenv.isDarwin [
           pkgs.darwin.apple_sdk.frameworks.CoreServices
         ];
+       
+        propagatedBuildInputs = with pkgs; [
+          pdf2svg
+          (texlive.combine {
+            inherit (texlive) scheme-basic
+            luatex85 standalone pgf tikz-cd;
+          })
+        ];
 
         GEN_ARTIFACTS = "artifacts";
         TYPST_VERSION = "${(importTOML ./Cargo.toml).package.version} (${rev "unknown hash"})";
