@@ -48,13 +48,6 @@
           pkgs.darwin.apple_sdk.frameworks.CoreServices
         ];
 
-        postInstall = ''
-          installManPage cli/artifacts/*.1
-          installShellCompletion \
-            cli/artifacts/typst.{bash,fish} \
-            --zsh cli/artifacts/_typst
-        '';
-
         GEN_ARTIFACTS = "artifacts";
         TYPST_VERSION = "${(importTOML ./Cargo.toml).package.version} (${rev "unknown hash"})";
       };
