@@ -51,9 +51,17 @@ pub struct Tikz {
 }
 
 fn execute(cmd: &mut Command) -> Result<(), String> {
-    let child = cmd.stdout(Stdio::piped()).spawn().map_err(|err| err.to_string())?;
-    let Output { status, stdout, .. } =
-        child.wait_with_output().map_err(|err| err.to_string())?;
+    let child = cmd.stdout(Stdio::piped()).spawn().map_err(|err| {
+        format!(
+            "failed to invoke {}: {}",
+            cmd.get_program().to_string_lossy(),
+            err.to_string()
+        )
+    })?;
+
+    let Output { status, stdout, .. } = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to fetch LaTeX process: {}", err.to_string()))?;
 
     if !status.success() {
         return Err(String::from_utf8(stdout).unwrap());
@@ -139,7 +147,9 @@ impl Tikz {
         let pdf_path = self.tempdir.path().join("tikz.pdf");
         let svg_path = self.tempdir.path().join("tikz.svg");
 
-        let mut file = File::create(&tex_path).map_err(|err| err.to_string())?;
+        let mut file = File::create(&tex_path).map_err(|err| {
+            format!("failed to create LaTeX buffer: {}", err.to_string())
+        })?;
         writeln!(file, "{}", LATEX_DOCUMENT_BEGIN).map_err(|err| err.to_string())?;
         writeln!(file, "\\begin{{{}}}", environment).map_err(|err| err.to_string())?;
         writeln!(file, "{}", tex_code.trim()).map_err(|err| err.to_string())?;
@@ -160,7 +170,8 @@ impl Tikz {
 
         execute(process_cmd)?;
 
-        read(&svg_path).map_err(|err| err.to_string())
+        read(&svg_path)
+            .map_err(|err| format!("failed to read generated SVG: {}", err.to_string()))
     }
 
     pub fn is_error(world: &dyn World, error: &SourceError) -> Option<u64> {
