@@ -88,6 +88,8 @@ impl Tikz {
             let environment = capture.name("environment").unwrap().as_str();
             let tex_code = capture.name("tex_code").unwrap().as_str();
 
+            let lines = "\n".repeat(tex_code.lines().count() - 1);
+
             let mut hasher = DefaultHasher::new();
             environment.hash(&mut hasher);
             tex_code.hash(&mut hasher);
@@ -106,7 +108,7 @@ impl Tikz {
             };
 
             let Ok(image) = image else {
-                images.push_back(format!(r#"image("{}{}{}")"#, PREFIX, hash, SUFFIX));
+                images.push_back(format!(r#"image("{}{}{}"){}"#, PREFIX, hash, SUFFIX, lines));
                 continue;
             };
 
@@ -122,8 +124,8 @@ impl Tikz {
             };
 
             images.push_back(format!(
-                r#"image("{}{}{}", width: {})"#,
-                PREFIX, hash, SUFFIX, width
+                r#"image("{}{}{}", width: {}){}"#,
+                PREFIX, hash, SUFFIX, width, lines
             ));
         }
 
@@ -180,5 +182,4 @@ impl Tikz {
             None
         }
     }
-
 }
