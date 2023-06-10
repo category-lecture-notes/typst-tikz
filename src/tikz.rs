@@ -15,15 +15,13 @@ use typst::World;
 const REGEX_PATTERN_TIKZ: &str = r"(?P<environment>tikzpicture|tikzcd)\[(?P<tex_code>[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]";
 
 const LATEX_ENGINE: &str = "lualatex";
-const LATEX_DOCUMENT_BEGIN: &str = r#"
-    \documentclass[tikz]{standalone}
-    \usepackage{tikz-cd}
+const LATEX_DOCUMENT_BEGIN: &str = concat!(
+    r#"\documentclass[tikz]{standalone}"#,
+    include_str!("../assets/latex/quiver.sty"),
+    r#"\begin{document}"#
+);
 
-    \begin{document}
-"#;
-const LATEX_DOCUMENT_END: &str = r#"
-    \end{document}
-"#;
+const LATEX_DOCUMENT_END: &str = r#"\end{document}"#;
 
 const LUA_CONFIG: &str = r#"
     texconfig.halt_on_error = true
@@ -52,16 +50,12 @@ pub struct Tikz {
 
 fn execute(cmd: &mut Command) -> Result<(), String> {
     let child = cmd.stdout(Stdio::piped()).spawn().map_err(|err| {
-        format!(
-            "failed to invoke {}: {}",
-            cmd.get_program().to_string_lossy(),
-            err.to_string()
-        )
+        format!("failed to invoke {}: {}", cmd.get_program().to_string_lossy(), err)
     })?;
 
     let Output { status, stdout, .. } = child
         .wait_with_output()
-        .map_err(|err| format!("failed to fetch LaTeX process: {}", err.to_string()))?;
+        .map_err(|err| format!("failed to fetch LaTeX process: {}", err))?;
 
     if !status.success() {
         return Err(String::from_utf8(stdout).unwrap());
@@ -147,9 +141,8 @@ impl Tikz {
         let pdf_path = self.tempdir.path().join("tikz.pdf");
         let svg_path = self.tempdir.path().join("tikz.svg");
 
-        let mut file = File::create(&tex_path).map_err(|err| {
-            format!("failed to create LaTeX buffer: {}", err.to_string())
-        })?;
+        let mut file = File::create(&tex_path)
+            .map_err(|err| format!("failed to create LaTeX buffer: {}", err))?;
         writeln!(file, "{}", LATEX_DOCUMENT_BEGIN).map_err(|err| err.to_string())?;
         writeln!(file, "\\begin{{{}}}", environment).map_err(|err| err.to_string())?;
         writeln!(file, "{}", tex_code.trim()).map_err(|err| err.to_string())?;
@@ -170,8 +163,7 @@ impl Tikz {
 
         execute(process_cmd)?;
 
-        read(&svg_path)
-            .map_err(|err| format!("failed to read generated SVG: {}", err.to_string()))
+        read(&svg_path).map_err(|err| format!("failed to read generated SVG: {}", err))
     }
 
     pub fn is_error(world: &dyn World, error: &SourceError) -> Option<u64> {

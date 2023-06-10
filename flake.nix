@@ -29,6 +29,11 @@
         else
           fallback;
 
+      texliveFor = pkgs: pkgs.texlive.combine {
+        inherit (pkgs.texlive) scheme-basic
+          amsfonts luatex85 standalone pgf tikz-cd;
+      };
+
       packageFor = pkgs: pkgs.rustPlatform.buildRustPackage {
         pname = "typst-tikz";
         version = rev "00000000";
@@ -47,13 +52,10 @@
         buildInputs = optionals pkgs.stdenv.isDarwin [
           pkgs.darwin.apple_sdk.frameworks.CoreServices
         ];
-       
+
         propagatedBuildInputs = with pkgs; [
           pdf2svg
-          (texlive.combine {
-            inherit (texlive) scheme-basic
-            luatex85 standalone pgf tikz-cd;
-          })
+          (texliveFor pkgs)
         ];
 
         GEN_ARTIFACTS = "artifacts";
@@ -70,10 +72,7 @@
             rust-analyzer
             rustc
             rustfmt
-            (texlive.combine {
-              inherit (pkgs.texlive) scheme-basic
-              luatex85 standalone pgf tikz-cd;
-            })
+            (texliveFor pkgs)
           ];
 
           buildInputs = optionals pkgs.stdenv.isDarwin [
