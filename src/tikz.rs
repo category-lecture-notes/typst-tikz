@@ -12,7 +12,8 @@ use tempfile::TempDir;
 use typst::diag::SourceError;
 use typst::World;
 
-const REGEX_PATTERN_TIKZ: &str = r"(?P<environment>tikzpicture|tikzcd)\[(?P<tex_code>[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]";
+const REGEX_PATTERN_TIKZ: &str =
+    r"(?P<environment>tikzpicture|tikzcd)\[(?<block>\s*```(?P<tex_code>(?s).*?)```\s*)\]";
 
 const LATEX_ENGINE: &str = "lualatex";
 const LATEX_DOCUMENT_BEGIN: &str = concat!(
@@ -88,9 +89,10 @@ impl Tikz {
 
         for capture in REG_TIKZ.captures_iter(buffer) {
             let environment = capture.name("environment").unwrap().as_str();
+            let block = capture.name("block").unwrap().as_str();
             let tex_code = capture.name("tex_code").unwrap().as_str();
 
-            let lines = "\n".repeat(tex_code.lines().count() - 1);
+            let lines = "\n".repeat(block.split('\n').count() - 1);
 
             let mut hasher = DefaultHasher::new();
             environment.hash(&mut hasher);
