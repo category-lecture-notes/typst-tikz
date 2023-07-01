@@ -1,17 +1,19 @@
 {
   inputs = {
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, fenix, nixpkgs }:
     let
-      inherit (builtins)
-        substring
-        ;
       inherit (nixpkgs.lib)
         genAttrs
         importTOML
         optionals
+        sourceByRegex
         ;
 
       eachSystem = f: genAttrs
@@ -23,64 +25,73 @@
         ]
         (system: f nixpkgs.legacyPackages.${system});
 
-      rev = fallback:
-        if self ? rev then
-          substring 0 8 self.rev
-        else
-          fallback;
-
       texliveFor = pkgs: pkgs.texlive.combine {
         inherit (pkgs.texlive) scheme-basic
           amsfonts luatex85 standalone pgf tikz-cd;
       };
 
-      packageFor = pkgs: pkgs.rustPlatform.buildRustPackage {
-        pname = "typst-tikz";
-        version = rev "00000000";
+      packageFor = pkgs:
+        let
+          rust = fenix.packages.${pkgs.stdenv.hostPlatform.system}.minimal.toolchain;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rust;
+            rustc = rust;
+          };
+        in
+        rustPlatform.buildRustPackage {
+          pname = "typst-tikz";
+          inherit ((importTOML ./Cargo.toml).package) version;
 
-        src = self;
+          src = sourceByRegex ./. [
+            "(assets|cli|docs|library|macros|src|tests)(/.*)?"
+            ''Cargo\.(toml|lock)''
+            ''build\.rs''
+          ];
 
-        cargoLock = {
-          lockFile = ./Cargo.lock;
-          allowBuiltinFetchGit = true;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            allowBuiltinFetchGit = true;
+          };
+
+          nativeBuildInputs = [
+            pkgs.installShellFiles
+          ];
+
+          buildInputs = optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.CoreServices
+          ];
+
+          propagatedBuildInputs = with pkgs; [
+            pdf2svg
+            (texliveFor pkgs)
+          ];
+
+          GEN_ARTIFACTS = "artifacts";
         };
-
-        nativeBuildInputs = [
-          pkgs.installShellFiles
-        ];
-
-        buildInputs = optionals pkgs.stdenv.isDarwin [
-          pkgs.darwin.apple_sdk.frameworks.CoreServices
-        ];
-
-        propagatedBuildInputs = with pkgs; [
-          pdf2svg
-          (texliveFor pkgs)
-        ];
-
-        GEN_ARTIFACTS = "artifacts";
-        TYPST_VERSION = "${(importTOML ./Cargo.toml).package.version} (${rev "unknown hash"})";
-      };
     in
     {
       devShells = eachSystem (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [
-            cargo
-            clippy
-            pdf2svg
-            rust-analyzer
-            rustc
-            rustfmt
-            (texliveFor pkgs)
-          ];
+          packages =
+            let
+              fenix'= fenix.packages.${pkgs.stdenv.hostPlatform.system};
+            in
+            with pkgs; [
+              (fenix'.default.withComponents [
+                "cargo"
+                "clippy"
+                "rustc"
+                "rustfmt"
+              ])
+              fenix'.rust-analyzer
+              pdf2svg
+              (texliveFor pkgs)
+            ];
 
           buildInputs = optionals pkgs.stdenv.isDarwin [
             pkgs.darwin.apple_sdk.frameworks.CoreServices
             pkgs.libiconv
           ];
-
-          RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
         };
       });
 

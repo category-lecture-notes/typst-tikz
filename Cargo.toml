@@ -4,8 +4,8 @@ description = "The command line interface for Typst, with TikZ support."
 categories = ["compilers", "command-line-utilities"]
 keywords = ["typst", "cli"]
 
-version = "0.4.0"
-rust-version = "1.67"
+version = "0.6.0"
+rust-version = "1.70"
 authors = ["The Typst Project Developers"]
 edition = "2021"
 homepage = "https://typst.app"
@@ -21,13 +21,14 @@ bench = false
 doc = false
 
 [dependencies]
-atty = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.2.4", features = ["derive", "env"] }
 codespan-reporting = "0.11"
 comemo = "0.3"
 dirs = "5"
 elsa = "1.8"
+flate2 = "1"
+gix-discover = "0.21"
 inferno = "0.11.15"
 lazy_static = "1"
 memmap2 = "0.5"
@@ -38,13 +39,15 @@ regex = "1"
 same-file = "1"
 siphasher = "0.3"
 svg_metadata = "0.4"
+tar = "0.4"
 tempfile = "3.5.0"
 tracing = "0.1.37"
 tracing-error = "0.2"
 tracing-flame = "0.2.0"
 tracing-subscriber = "0.3.17"
-typst = { git = "https://github.com/typst/typst", rev = "v0.4.0" }
-typst-library = { git = "https://github.com/typst/typst", rev = "v0.4.0" }
+typst = { git = "https://github.com/typst/typst", rev = "v0.6.0" }
+typst-library = { git = "https://github.com/typst/typst", rev = "v0.6.0" }
+ureq = "2"
 walkdir = "2"
 
 [build-dependencies]

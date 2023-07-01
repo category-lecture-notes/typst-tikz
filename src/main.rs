@@ -2,132 +2,57 @@ mod args;
 mod tikz;
 mod trace;
 
-use std::cell::{RefCell, RefMut};
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell, RefMut};
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs::{self, File};
 use std::hash::Hash;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::ExitCode;
 
-use atty::Stream;
+use chrono::Datelike;
 use clap::Parser;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::term::{self, termcolor};
 use comemo::Prehashed;
-use elsa::FrozenVec;
 use memmap2::Mmap;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use once_cell::unsync::OnceCell;
 use same_file::{is_same_file, Handle};
 use siphasher::sip128::{Hasher128, SipHasher13};
+use std::cell::OnceCell;
 use termcolor::{ColorChoice, StandardStream, WriteColor};
-use typst::diag::{FileError, FileResult, SourceError, StrResult};
-use typst::eval::Library;
+use typst::diag::{
+    bail, FileError, FileResult, PackageError, PackageResult, SourceError, StrResult,
+};
+use typst::doc::Document;
+use typst::eval::{eco_format, Datetime, Library};
+use typst::file::{FileId, PackageSpec};
 use typst::font::{Font, FontBook, FontInfo, FontVariant};
-use typst::syntax::{Source, SourceId};
-use typst::util::{Buffer, PathExt};
+use typst::geom::Color;
+use typst::syntax::Source;
+use typst::util::{Bytes, PathExt};
 use typst::World;
 use walkdir::WalkDir;
 
-use crate::args::{CliArguments, Command, CompileCommand};
+use crate::args::{CliArguments, Command, CompileCommand, DiagnosticFormat};
 use crate::tikz::Tikz;
-use crate::trace::init_tracing;
 
 type CodespanResult<T> = Result<T, CodespanError>;
 type CodespanError = codespan_reporting::files::Error;
 
-pub fn typst_version() -> &'static str {
-    env!("TYPST_VERSION")
-}
-
-/// A summary of the input arguments relevant to compilation.
-struct CompileSettings {
-    /// The path to the input file.
-    input: PathBuf,
-
-    /// The path to the output file.
-    output: PathBuf,
-
-    /// Whether to watch the input files for changes.
-    watch: bool,
-
-    /// The root directory for absolute paths.
-    root: Option<PathBuf>,
-
-    /// The paths to search for fonts.
-    font_paths: Vec<PathBuf>,
-
-    /// The open command to use.
-    open: Option<Option<String>>,
-}
-
-impl CompileSettings {
-    /// Create a new compile settings from the field values.
-    pub fn new(
-        input: PathBuf,
-        output: Option<PathBuf>,
-        watch: bool,
-        root: Option<PathBuf>,
-        font_paths: Vec<PathBuf>,
-        open: Option<Option<String>>,
-    ) -> Self {
-        let output = match output {
-            Some(path) => path,
-            None => input.with_extension("pdf"),
-        };
-        Self { input, output, watch, root, font_paths, open }
-    }
-
-    /// Create a new compile settings from the CLI arguments and a compile command.
-    ///
-    /// # Panics
-    /// Panics if the command is not a compile or watch command.
-    pub fn with_arguments(args: CliArguments) -> Self {
-        let watch = matches!(args.command, Command::Watch(_));
-        let CompileCommand { input, output, open, .. } = match args.command {
-            Command::Compile(command) => command,
-            Command::Watch(command) => command,
-            _ => unreachable!(),
-        };
-        Self::new(input, output, watch, args.root, args.font_paths, open)
-    }
-}
-
-struct FontsSettings {
-    /// The font paths
-    font_paths: Vec<PathBuf>,
-
-    /// Whether to include font variants
-    variants: bool,
-}
-
-impl FontsSettings {
-    /// Create font settings from the field values.
-    pub fn new(font_paths: Vec<PathBuf>, variants: bool) -> Self {
-        Self { font_paths, variants }
-    }
-
-    /// Create a new font settings from the CLI arguments.
-    ///
-    /// # Panics
-    /// Panics if the command is not a fonts command.
-    pub fn with_arguments(args: CliArguments) -> Self {
-        match args.command {
-            Command::Fonts(command) => Self::new(args.font_paths, command.variants),
-            _ => unreachable!(),
-        }
-    }
+thread_local! {
+    static EXIT: Cell<ExitCode> = Cell::new(ExitCode::SUCCESS);
 }
 
 /// Entry point.
-fn main() {
+fn main() -> ExitCode {
     let arguments = CliArguments::parse();
-    let _guard = match init_tracing(&arguments) {
+    let _guard = match crate::trace::init_tracing(&arguments) {
         Ok(guard) => guard,
         Err(err) => {
-            eprintln!("failed to initialize tracing, reason: {}", err);
-            return;
+            eprintln!("failed to initialize tracing {}", err);
+            None
         }
     };
 
@@ -139,13 +64,21 @@ fn main() {
     };
 
     if let Err(msg) = res {
+        set_failed();
         print_error(&msg).expect("failed to print error");
     }
+
+    EXIT.with(|cell| cell.get())
+}
+
+/// Ensure a failure exit code.
+fn set_failed() {
+    EXIT.with(|cell| cell.set(ExitCode::FAILURE));
 }
 
 /// Print an application-level error (independent from a source file).
 fn print_error(msg: &str) -> io::Result<()> {
-    let mut w = StandardStream::stderr(ColorChoice::Auto);
+    let mut w = color_stream();
     let styles = term::Styles::default();
 
     w.set_color(&styles.header_error)?;
@@ -155,55 +88,138 @@ fn print_error(msg: &str) -> io::Result<()> {
     writeln!(w, ": {msg}.")
 }
 
-/// Execute a compilation command.
-fn compile(mut command: CompileSettings) -> StrResult<()> {
-    let root = if let Some(root) = &command.root {
-        root.clone()
-    } else if let Some(dir) = command
-        .input
-        .canonicalize()
-        .ok()
-        .as_ref()
-        .and_then(|path| path.parent())
-    {
-        dir.into()
-    } else {
-        PathBuf::new()
-    };
+/// Used by `args.rs`.
+pub fn typst_version() -> &'static str {
+    env!("TYPST_VERSION")
+}
 
-    let tikz = Tikz::new().map_err(|err| err.to_string())?;
+/// A summary of the input arguments relevant to compilation.
+struct CompileSettings {
+    /// The project's root directory.
+    root: Option<PathBuf>,
+    /// The path to the input file.
+    input: PathBuf,
+    /// The path to the output file.
+    output: PathBuf,
+    /// Whether to watch the input files for changes.
+    watch: bool,
+    /// The paths to search for fonts.
+    font_paths: Vec<PathBuf>,
+    /// The open command to use.
+    open: Option<Option<String>>,
+    /// The PPI to use for PNG export.
+    ppi: Option<f32>,
+    /// In which format to emit diagnostics.
+    diagnostic_format: DiagnosticFormat,
+}
 
-    // Create the world that serves sources, fonts and files.
-    let mut world = SystemWorld::new(root, &command.font_paths, tikz);
-
-    // Perform initial compilation.
-    let failed = compile_once(&mut world, &command)?;
-
-    // open the file if requested, this must be done on the first **successful** compilation
-    if !failed {
-        if let Some(open) = command.open.take() {
-            open_file(open.as_deref(), &command.output)?;
+impl CompileSettings {
+    /// Create a new compile settings from the field values.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        input: PathBuf,
+        output: Option<PathBuf>,
+        root: Option<PathBuf>,
+        font_paths: Vec<PathBuf>,
+        watch: bool,
+        open: Option<Option<String>>,
+        ppi: Option<f32>,
+        diagnostic_format: DiagnosticFormat,
+    ) -> Self {
+        let output = match output {
+            Some(path) => path,
+            None => input.with_extension("pdf"),
+        };
+        Self {
+            root,
+            input,
+            output,
+            watch,
+            font_paths,
+            open,
+            diagnostic_format,
+            ppi,
         }
     }
 
-    if !command.watch {
-        // Return with non-zero exit code in case of error.
-        if failed {
-            process::exit(1);
-        }
+    /// Create a new compile settings from the CLI arguments and a compile command.
+    ///
+    /// # Panics
+    /// Panics if the command is not a compile or watch command.
+    fn with_arguments(args: CliArguments) -> Self {
+        let watch = matches!(args.command, Command::Watch(_));
+        let CompileCommand { input, output, open, ppi, diagnostic_format, .. } =
+            match args.command {
+                Command::Compile(command) => command,
+                Command::Watch(command) => command,
+                _ => unreachable!(),
+            };
 
+        Self::new(
+            input,
+            output,
+            args.root,
+            args.font_paths,
+            watch,
+            open,
+            ppi,
+            diagnostic_format,
+        )
+    }
+}
+
+struct FontsSettings {
+    /// The font paths
+    font_paths: Vec<PathBuf>,
+    /// Whether to include font variants
+    variants: bool,
+}
+
+impl FontsSettings {
+    /// Create font settings from the field values.
+    fn new(font_paths: Vec<PathBuf>, variants: bool) -> Self {
+        Self { font_paths, variants }
+    }
+
+    /// Create a new font settings from the CLI arguments.
+    ///
+    /// # Panics
+    /// Panics if the command is not a fonts command.
+    fn with_arguments(args: CliArguments) -> Self {
+        match args.command {
+            Command::Fonts(command) => Self::new(args.font_paths, command.variants),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Execute a compilation command.
+fn compile(mut settings: CompileSettings) -> StrResult<()> {
+    // Create the world that serves sources, files, and fonts.
+    let mut world = SystemWorld::new(&settings)?;
+
+    // Perform initial compilation.
+    let ok = compile_once(&mut world, &settings)?;
+
+    // Open the file if requested, this must be done on the first **successful**
+    // compilation.
+    if ok {
+        if let Some(open) = settings.open.take() {
+            open_file(open.as_deref(), &settings.output)?;
+        }
+    }
+
+    if !settings.watch {
         return Ok(());
     }
 
     // Setup file watching.
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())
-        .map_err(|_| "failed to watch directory")?;
+        .map_err(|_| "failed to setup file watching")?;
 
-    // Watch root directory recursively.
-    watcher
-        .watch(&world.root, RecursiveMode::Recursive)
-        .map_err(|_| "failed to watch directory")?;
+    // Watch all the files that are used by the input file and its dependencies.
+    world.watch(&mut watcher, HashSet::new())?;
 
     // Handle events.
     let timeout = std::time::Duration::from_millis(100);
@@ -218,76 +234,129 @@ fn compile(mut command: CompileSettings) -> StrResult<()> {
             if event
                 .paths
                 .iter()
-                .all(|path| is_same_file(path, &command.output).unwrap_or(false))
+                .all(|path| is_same_file(path, &settings.output).unwrap_or(false))
             {
                 continue;
             }
 
-            recompile |= world.relevant(&event);
+            recompile |= is_event_relevant(&event);
         }
 
         if recompile {
-            compile_once(&mut world, &command)?;
-            comemo::evict(30);
+            // Retrieve the dependencies of the last compilation.
+            let dependencies = world.dependencies();
 
-            // open the file if requested, this must be done on the first **successful** compilation
-            if let Some(open) = command.open.take() {
-                open_file(open.as_deref(), &command.output)?;
+            // Recompile.
+            let ok = compile_once(&mut world, &settings)?;
+            comemo::evict(10);
+
+            // Adjust the watching.
+            world.watch(&mut watcher, dependencies)?;
+
+            // Open the file if requested, this must be done on the first
+            // **successful** compilation
+            if ok {
+                if let Some(open) = settings.open.take() {
+                    open_file(open.as_deref(), &settings.output)?;
+                }
             }
         }
     }
 }
-
 /// Compile a single time.
+///
+/// Returns whether it compiled without errors.
 #[tracing::instrument(skip_all)]
-fn compile_once(world: &mut SystemWorld, command: &CompileSettings) -> StrResult<bool> {
+fn compile_once(world: &mut SystemWorld, settings: &CompileSettings) -> StrResult<bool> {
     tracing::info!("Starting compilation");
 
-    status(command, Status::Compiling).unwrap();
+    let start = std::time::Instant::now();
+    status(settings, Status::Compiling).unwrap();
 
+    // Reset everything and ensure that the main file is still present.
     world.reset();
-    world.main = world.resolve(&command.input).map_err(|err| err.to_string())?;
+    world.source(world.main).map_err(|err| err.to_string())?;
 
-    match typst::compile(world) {
-        // Export the PDF.
+    let result = typst::compile(world);
+    let duration = start.elapsed();
+
+    match result {
+        // Export the PDF / PNG.
         Ok(document) => {
-            let buffer = typst::export::pdf(&document);
-            fs::write(&command.output, buffer).map_err(|_| "failed to write PDF file")?;
-            status(command, Status::Success).unwrap();
-
-            tracing::info!("Compilation succeeded");
-            Ok(false)
+            export(&document, settings)?;
+            status(settings, Status::Success(duration)).unwrap();
+            tracing::info!("Compilation succeeded in {duration:?}");
+            Ok(true)
         }
 
         // Print diagnostics.
         Err(errors) => {
-            status(command, Status::Error).unwrap();
-            print_diagnostics(world, *errors)
+            set_failed();
+            status(settings, Status::Error).unwrap();
+            print_diagnostics(world, *errors, settings.diagnostic_format)
                 .map_err(|_| "failed to print diagnostics")?;
-
-            tracing::info!("Compilation failed");
-            Ok(true)
+            tracing::info!("Compilation failed after {duration:?}");
+            Ok(false)
         }
     }
 }
 
+/// Export into the target format.
+fn export(document: &Document, settings: &CompileSettings) -> StrResult<()> {
+    match settings.output.extension() {
+        Some(ext) if ext.eq_ignore_ascii_case("png") => {
+            // Determine whether we have a `{n}` numbering.
+            let string = settings.output.to_str().unwrap_or_default();
+            let numbered = string.contains("{n}");
+            if !numbered && document.pages.len() > 1 {
+                bail!("cannot export multiple PNGs without `{{n}}` in output path");
+            }
+
+            // Find a number width that accommodates all pages. For instance, the
+            // first page should be numbered "001" if there are between 100 and
+            // 999 pages.
+            let width = 1 + document.pages.len().checked_ilog10().unwrap_or(0) as usize;
+            let ppi = settings.ppi.unwrap_or(2.0);
+            let mut storage;
+
+            for (i, frame) in document.pages.iter().enumerate() {
+                let pixmap = typst::export::render(frame, ppi, Color::WHITE);
+                let path = if numbered {
+                    storage = string.replace("{n}", &format!("{:0width$}", i + 1));
+                    Path::new(&storage)
+                } else {
+                    settings.output.as_path()
+                };
+                pixmap.save_png(path).map_err(|_| "failed to write PNG file")?;
+            }
+        }
+        _ => {
+            let buffer = typst::export::pdf(document);
+            fs::write(&settings.output, buffer)
+                .map_err(|_| "failed to write PDF file")?;
+        }
+    }
+    Ok(())
+}
+
 /// Clear the terminal and render the status message.
 #[tracing::instrument(skip_all)]
-fn status(command: &CompileSettings, status: Status) -> io::Result<()> {
-    if !command.watch {
+fn status(settings: &CompileSettings, status: Status) -> io::Result<()> {
+    if !settings.watch {
         return Ok(());
     }
 
     let esc = 27 as char;
-    let input = command.input.display();
-    let output = command.output.display();
+    let input = settings.input.display();
+    let output = settings.output.display();
     let time = chrono::offset::Local::now();
     let timestamp = time.format("%H:%M:%S");
     let message = status.message();
     let color = status.color();
 
-    let mut w = StandardStream::stderr(ColorChoice::Auto);
-    if atty::is(Stream::Stderr) {
+    let mut w = color_stream();
+    if std::io::stderr().is_terminal() {
+        // Clear the terminal.
         write!(w, "{esc}c{esc}[1;1H")?;
     }
 
@@ -308,19 +377,28 @@ fn status(command: &CompileSettings, status: Status) -> io::Result<()> {
     w.flush()
 }
 
+/// Get stderr with color support if desirable.
+fn color_stream() -> termcolor::StandardStream {
+    termcolor::StandardStream::stderr(if std::io::stderr().is_terminal() {
+        ColorChoice::Auto
+    } else {
+        ColorChoice::Never
+    })
+}
+
 /// The status in which the watcher can be.
 enum Status {
     Compiling,
-    Success,
+    Success(std::time::Duration),
     Error,
 }
 
 impl Status {
-    fn message(&self) -> &str {
+    fn message(&self) -> String {
         match self {
-            Self::Compiling => "compiling ...",
-            Self::Success => "compiled successfully",
-            Self::Error => "compiled with errors",
+            Self::Compiling => "compiling ...".into(),
+            Self::Success(duration) => format!("compiled successfully in {duration:.2?}"),
+            Self::Error => "compiled with errors".into(),
         }
     }
 
@@ -337,14 +415,20 @@ impl Status {
 fn print_diagnostics(
     world: &SystemWorld,
     errors: Vec<SourceError>,
+    diagnostic_format: DiagnosticFormat,
 ) -> Result<(), codespan_reporting::files::Error> {
-    let mut w = StandardStream::stderr(ColorChoice::Auto);
-    let config = term::Config { tab_width: 2, ..Default::default() };
+    let mut w = match diagnostic_format {
+        DiagnosticFormat::Human => color_stream(),
+        DiagnosticFormat::Short => StandardStream::stderr(ColorChoice::Never),
+    };
+
+    let mut config = term::Config { tab_width: 2, ..Default::default() };
+    if diagnostic_format == DiagnosticFormat::Short {
+        config.display_style = term::DisplayStyle::Short;
+    }
 
     for error in errors {
         // The main diagnostic.
-        let range = error.range(world);
-
         if let Some(id) = Tikz::is_error(world, &error) {
             let logs = world.tikz.fetch(id).as_ref().unwrap_err().clone();
 
@@ -356,14 +440,26 @@ fn print_diagnostics(
 
             let diag = Diagnostic::help()
                 .with_message("the TikZ figure comes from this generated image")
-                .with_labels(vec![Label::primary(error.span.source(), range)]);
+                .with_labels(vec![Label::primary(
+                    error.span.id(),
+                    error.span.range(world),
+                )]);
 
             term::emit(&mut w, &config, world, &diag)?;
         } else {
-            let range = error.range(world);
             let diag = Diagnostic::error()
                 .with_message(error.message)
-                .with_labels(vec![Label::primary(error.span.source(), range)]);
+                .with_notes(
+                    error
+                        .hints
+                        .iter()
+                        .map(|e| (eco_format!("hint: {e}")).into())
+                        .collect(),
+                )
+                .with_labels(vec![Label::primary(
+                    error.span.id(),
+                    error.span.range(world),
+                )]);
 
             term::emit(&mut w, &config, world, &diag)?;
         }
@@ -372,27 +468,11 @@ fn print_diagnostics(
         for point in error.trace {
             let message = point.v.to_string();
             let help = Diagnostic::help().with_message(message).with_labels(vec![
-                Label::primary(
-                    point.span.source(),
-                    world.source(point.span.source()).range(point.span),
-                ),
+                Label::primary(point.span.id(), point.span.range(world)),
             ]);
 
             term::emit(&mut w, &config, world, &help)?;
         }
-    }
-
-    Ok(())
-}
-
-/// Opens the given file using:
-/// - The default file viewer if `open` is `None`.
-/// - The given viewer provided by `open` if it is `Some`.
-fn open_file(open: Option<&str>, path: &Path) -> StrResult<()> {
-    if let Some(app) = open {
-        open::with_in_background(path, app);
-    } else {
-        open::that_in_background(path);
     }
 
     Ok(())
@@ -418,172 +498,252 @@ fn fonts(command: FontsSettings) -> StrResult<()> {
 
 /// A world that provides access to the operating system.
 struct SystemWorld {
+    /// The root relative to which absolute paths are resolved.
     root: PathBuf,
+    /// The input path.
+    main: FileId,
+    /// Typst's standard library.
     library: Prehashed<Library>,
+    /// Metadata about discovered fonts.
     book: Prehashed<FontBook>,
+    /// Locations of and storage for lazily loaded fonts.
     fonts: Vec<FontSlot>,
-    hashes: RefCell<HashMap<PathBuf, FileResult<PathHash>>>,
+    /// Maps package-path combinations to canonical hashes. All package-path
+    /// combinations that point to the same file are mapped to the same hash. To
+    /// be used in conjunction with `paths`.
+    hashes: RefCell<HashMap<FileId, FileResult<PathHash>>>,
+    /// Maps canonical path hashes to source files and buffers.
     paths: RefCell<HashMap<PathHash, PathSlot>>,
-    sources: FrozenVec<Box<Source>>,
-    main: SourceId,
+    /// The current date if requested. This is stored here to ensure it is
+    /// always the same within one compilation. Reset between compilations.
+    today: OnceCell<Option<Datetime>>,
+    /// Maps each LaTeX code to its compiled TikZ image.
     tikz: Tikz,
 }
 
 /// Holds details about the location of a font and lazily the font itself.
 struct FontSlot {
+    /// The path at which the font can be found on the system.
     path: PathBuf,
+    /// The index of the font in its collection. Zero if the path does not point
+    /// to a collection.
     index: u32,
+    /// The lazily loaded font.
     font: OnceCell<Option<Font>>,
 }
 
 /// Holds canonical data for all paths pointing to the same entity.
-#[derive(Default)]
+///
+/// Both fields can be populated if the file is both imported and read().
 struct PathSlot {
-    source: OnceCell<FileResult<SourceId>>,
-    buffer: OnceCell<FileResult<Buffer>>,
+    /// The slot's path on the system.
+    system_path: PathBuf,
+    /// The lazily loaded source file for a path hash.
+    source: OnceCell<FileResult<Source>>,
+    /// The lazily loaded buffer for a path hash.
+    buffer: OnceCell<FileResult<Bytes>>,
 }
 
 impl SystemWorld {
-    fn new(root: PathBuf, font_paths: &[PathBuf], tikz: Tikz) -> Self {
+    fn new(settings: &CompileSettings) -> StrResult<Self> {
         let mut searcher = FontSearcher::new();
-        searcher.search(font_paths);
+        searcher.search(&settings.font_paths);
 
-        Self {
+        // Resolve the system-global input path.
+        let system_input = settings.input.canonicalize().map_err(|_| {
+            eco_format!("input file not found (searched at {})", settings.input.display())
+        })?;
+
+        // Resolve the system-global root directory.
+        let root = {
+            let path = settings
+                .root
+                .as_deref()
+                .or_else(|| system_input.parent())
+                .unwrap_or(Path::new("."));
+            path.canonicalize().map_err(|_| {
+                eco_format!("root directory not found (searched at {})", path.display())
+            })?
+        };
+
+        // Resolve the input path within the project.
+        let project_input = system_input
+            .strip_prefix(&root)
+            .map(|path| Path::new("/").join(path))
+            .map_err(|_| "input file must be contained in project root")?;
+
+        let tikz = Tikz::new().map_err(|err| err.to_string())?;
+
+        Ok(Self {
             root,
+            main: FileId::new(None, &project_input),
             library: Prehashed::new(typst_library::build()),
             book: Prehashed::new(searcher.book),
             fonts: searcher.fonts,
             hashes: RefCell::default(),
             paths: RefCell::default(),
-            sources: FrozenVec::new(),
-            main: SourceId::detached(),
+            today: OnceCell::new(),
             tikz,
-        }
+        })
     }
 }
 
 impl World for SystemWorld {
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn library(&self) -> &Prehashed<Library> {
         &self.library
-    }
-
-    fn main(&self) -> &Source {
-        self.source(self.main)
-    }
-
-    #[tracing::instrument(skip_all)]
-    fn resolve(&self, path: &Path) -> FileResult<SourceId> {
-        self.slot(path)?
-            .source
-            .get_or_init(|| {
-                let buf = read(path)?;
-                let text = String::from_utf8(buf)?;
-
-                Ok(self.insert(path, self.tikz.replace(&text)))
-            })
-            .clone()
-    }
-
-    fn source(&self, id: SourceId) -> &Source {
-        &self.sources[id.into_u16() as usize]
     }
 
     fn book(&self) -> &Prehashed<FontBook> {
         &self.book
     }
 
-    fn font(&self, id: usize) -> Option<Font> {
-        let slot = &self.fonts[id];
-        slot.font
+    fn main(&self) -> Source {
+        self.source(self.main).unwrap()
+    }
+
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        let slot = self.slot(id)?;
+        slot.source
             .get_or_init(|| {
-                let data = self.file(&slot.path).ok()?;
-                Font::new(data, slot.index)
+                let buf = read(&slot.system_path)?;
+                let text = decode_utf8(buf)?;
+                Ok(Source::new(id, self.tikz.replace(&text)))
             })
             .clone()
     }
 
-    fn file(&self, path: &Path) -> FileResult<Buffer> {
-        let filename = path.file_name().unwrap().to_str().unwrap();
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        let filename = id.path().file_name().unwrap().to_str().unwrap();
 
         if let Some(id) = Tikz::is_filename(filename) {
             return self
                 .tikz
                 .fetch(id)
                 .as_ref()
-                .map(|f| Buffer::from(f.as_slice()))
+                .map(|f| Bytes::from(f.as_slice()))
                 .or(Err(FileError::Other));
         }
 
-        self.slot(path)?
-            .buffer
-            .get_or_init(|| read(path).map(Buffer::from))
+        let slot = self.slot(id)?;
+        slot.buffer
+            .get_or_init(|| read(&slot.system_path).map(Bytes::from))
             .clone()
+    }
+
+    fn font(&self, id: usize) -> Option<Font> {
+        let slot = &self.fonts[id];
+        slot.font
+            .get_or_init(|| {
+                let data = read(&slot.path).ok()?.into();
+                Font::new(data, slot.index)
+            })
+            .clone()
+    }
+
+    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+        *self.today.get_or_init(|| {
+            let naive = match offset {
+                None => chrono::Local::now().naive_local(),
+                Some(o) => (chrono::Utc::now() + chrono::Duration::hours(o)).naive_utc(),
+            };
+
+            Datetime::from_ymd(
+                naive.year(),
+                naive.month().try_into().ok()?,
+                naive.day().try_into().ok()?,
+            )
+        })
     }
 }
 
 impl SystemWorld {
+    /// Access the canonical slot for the given path.
     #[tracing::instrument(skip_all)]
-    fn slot(&self, path: &Path) -> FileResult<RefMut<PathSlot>> {
-        let mut hashes = self.hashes.borrow_mut();
-        let hash = match hashes.get(path).cloned() {
-            Some(hash) => hash,
-            None => {
-                let hash = PathHash::new(path);
-                if let Ok(canon) = path.canonicalize() {
-                    hashes.insert(canon.normalize(), hash.clone());
-                }
-                hashes.insert(path.into(), hash.clone());
-                hash
-            }
-        }?;
+    fn slot(&self, id: FileId) -> FileResult<RefMut<PathSlot>> {
+        let mut system_path = PathBuf::new();
+        let hash = self
+            .hashes
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| {
+                // Determine the root path relative to which the file path
+                // will be resolved.
+                let root = match id.package() {
+                    Some(spec) => prepare_package(&self.root, spec)?,
+                    None => self.root.clone(),
+                };
 
-        Ok(std::cell::RefMut::map(self.paths.borrow_mut(), |paths| {
-            paths.entry(hash).or_default()
+                // Join the path to the root. If it tries to escape, deny
+                // access. Note: It can still escape via symlinks.
+                system_path =
+                    root.join_rooted(id.path()).ok_or(FileError::AccessDenied)?;
+
+                PathHash::new(&system_path)
+            })
+            .clone()?;
+
+        Ok(RefMut::map(self.paths.borrow_mut(), |paths| {
+            paths.entry(hash).or_insert_with(|| PathSlot {
+                // This will only trigger if the `or_insert_with` above also
+                // triggered.
+                system_path,
+                source: OnceCell::new(),
+                buffer: OnceCell::new(),
+            })
         }))
     }
 
+    /// Collect all paths the last compilation depended on.
     #[tracing::instrument(skip_all)]
-    fn insert(&self, path: &Path, text: String) -> SourceId {
-        let id = SourceId::from_u16(self.sources.len() as u16);
-        let source = Source::new(id, path, text);
-        self.sources.push(Box::new(source));
-        id
+    fn dependencies(&self) -> HashSet<PathBuf> {
+        self.paths
+            .borrow()
+            .values()
+            .map(|slot| slot.system_path.clone())
+            .collect()
     }
 
-    fn relevant(&mut self, event: &notify::Event) -> bool {
-        match &event.kind {
-            notify::EventKind::Any => {}
-            notify::EventKind::Access(_) => return false,
-            notify::EventKind::Create(_) => return true,
-            notify::EventKind::Modify(kind) => match kind {
-                notify::event::ModifyKind::Any => {}
-                notify::event::ModifyKind::Data(_) => {}
-                notify::event::ModifyKind::Metadata(_) => return false,
-                notify::event::ModifyKind::Name(_) => return true,
-                notify::event::ModifyKind::Other => return false,
-            },
-            notify::EventKind::Remove(_) => {}
-            notify::EventKind::Other => return false,
+    /// Adjust the file watching. Watches all new dependencies and unwatches
+    /// all `previous` dependencies that are not relevant anymore.
+    #[tracing::instrument(skip_all)]
+    fn watch(
+        &self,
+        watcher: &mut dyn Watcher,
+        mut previous: HashSet<PathBuf>,
+    ) -> StrResult<()> {
+        // Watch new paths that weren't watched yet.
+        for slot in self.paths.borrow().values() {
+            let path = &slot.system_path;
+            let watched = previous.remove(path);
+            if path.exists() && !watched {
+                tracing::info!("Watching {}", path.display());
+                watcher
+                    .watch(path, RecursiveMode::NonRecursive)
+                    .map_err(|_| eco_format!("failed to watch {path:?}"))?;
+            }
         }
 
-        event.paths.iter().any(|path| self.dependant(path))
+        // Unwatch old paths that don't need to be watched anymore.
+        for path in previous {
+            tracing::info!("Unwatching {}", path.display());
+            watcher.unwatch(&path).ok();
+        }
+
+        Ok(())
     }
 
-    fn dependant(&self, path: &Path) -> bool {
-        self.hashes.borrow().contains_key(&path.normalize())
-            || PathHash::new(path)
-                .map_or(false, |hash| self.paths.borrow().contains_key(&hash))
-    }
-
+    /// Reset th compilation state in preparation of a new compilation.
     #[tracing::instrument(skip_all)]
     fn reset(&mut self) {
-        self.sources.as_mut().clear();
         self.hashes.borrow_mut().clear();
         self.paths.borrow_mut().clear();
+        self.today.take();
+    }
+
+    /// Lookup a source file by id.
+    #[track_caller]
+    fn lookup(&self, id: FileId) -> Source {
+        self.source(id).expect("file id does not point to any source file")
     }
 }
 
@@ -612,21 +772,145 @@ fn read(path: &Path) -> FileResult<Vec<u8>> {
     }
 }
 
+/// Decode UTF-8 with an optional BOM.
+fn decode_utf8(buf: Vec<u8>) -> FileResult<String> {
+    Ok(if buf.starts_with(b"\xef\xbb\xbf") {
+        // Remove UTF-8 BOM.
+        std::str::from_utf8(&buf[3..])?.into()
+    } else {
+        // Assume UTF-8.
+        String::from_utf8(buf)?
+    })
+}
+
+/// Make a package available in the on-disk cache.
+fn prepare_package(root: &PathBuf, spec: &PackageSpec) -> PackageResult<PathBuf> {
+    let subdir = format!("{}/{}-{}", spec.namespace, spec.name, spec.version);
+
+    if spec.namespace == "vendor" {
+        use gix_discover::repository::Path::WorkTree;
+
+        let Ok((WorkTree(path), _)) = gix_discover::upwards(root) else {
+            return Err(PackageError::NotFound(spec.clone()));
+        };
+
+        let dir = path.join(&subdir);
+        if dir.exists() {
+            return Ok(dir);
+        }
+        return Err(PackageError::NotFound(spec.clone()));
+    }
+
+    let subdir = format!("typst/packages/{}", subdir);
+
+    if let Some(data_dir) = dirs::data_dir() {
+        let dir = data_dir.join(&subdir);
+        if dir.exists() {
+            return Ok(dir);
+        }
+    }
+
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let dir = cache_dir.join(&subdir);
+
+        // Download from network if it doesn't exist yet.
+        if spec.namespace == "preview" && !dir.exists() {
+            download_package(spec, &dir)?;
+        }
+
+        if dir.exists() {
+            return Ok(dir);
+        }
+    }
+
+    Err(PackageError::NotFound(spec.clone()))
+}
+
+/// Download a package over the network.
+fn download_package(spec: &PackageSpec, package_dir: &Path) -> PackageResult<()> {
+    // The `@preview` namespace is the only namespace that supports on-demand
+    // fetching.
+    assert_eq!(spec.namespace, "preview");
+
+    let url = format!(
+        "https://packages.typst.org/preview/{}-{}.tar.gz",
+        spec.name, spec.version
+    );
+
+    print_downloading(spec).unwrap();
+    let reader = match ureq::get(&url).call() {
+        Ok(response) => response.into_reader(),
+        Err(ureq::Error::Status(404, _)) => {
+            return Err(PackageError::NotFound(spec.clone()))
+        }
+        Err(_) => return Err(PackageError::NetworkFailed),
+    };
+
+    let decompressed = flate2::read::GzDecoder::new(reader);
+    tar::Archive::new(decompressed).unpack(package_dir).map_err(|_| {
+        fs::remove_dir_all(package_dir).ok();
+        PackageError::MalformedArchive
+    })
+}
+
+/// Print that a package downloading is happening.
+fn print_downloading(spec: &PackageSpec) -> io::Result<()> {
+    let mut w = color_stream();
+    let styles = term::Styles::default();
+
+    w.set_color(&styles.header_help)?;
+    write!(w, "downloading")?;
+
+    w.reset()?;
+    writeln!(w, " {spec}")
+}
+
+/// Opens the given file using:
+/// - The default file viewer if `open` is `None`.
+/// - The given viewer provided by `open` if it is `Some`.
+fn open_file(open: Option<&str>, path: &Path) -> StrResult<()> {
+    if let Some(app) = open {
+        open::with_in_background(path, app);
+    } else {
+        open::that_in_background(path);
+    }
+
+    Ok(())
+}
+
+/// Whether a watch event is relevant for compilation.
+fn is_event_relevant(event: &notify::Event) -> bool {
+    match &event.kind {
+        notify::EventKind::Any => true,
+        notify::EventKind::Access(_) => false,
+        notify::EventKind::Create(_) => true,
+        notify::EventKind::Modify(kind) => match kind {
+            notify::event::ModifyKind::Any => true,
+            notify::event::ModifyKind::Data(_) => true,
+            notify::event::ModifyKind::Metadata(_) => false,
+            notify::event::ModifyKind::Name(_) => true,
+            notify::event::ModifyKind::Other => false,
+        },
+        notify::EventKind::Remove(_) => true,
+        notify::EventKind::Other => false,
+    }
+}
+
 impl<'a> codespan_reporting::files::Files<'a> for SystemWorld {
-    type FileId = SourceId;
-    type Name = std::path::Display<'a>;
-    type Source = &'a str;
+    type FileId = FileId;
+    type Name = FileId;
+    type Source = Source;
 
-    fn name(&'a self, id: SourceId) -> CodespanResult<Self::Name> {
-        Ok(World::source(self, id).path().display())
+    fn name(&'a self, id: FileId) -> CodespanResult<Self::Name> {
+        Ok(id)
     }
 
-    fn source(&'a self, id: SourceId) -> CodespanResult<Self::Source> {
-        Ok(World::source(self, id).text())
+    fn source(&'a self, id: FileId) -> CodespanResult<Self::Source> {
+        Ok(self.lookup(id))
     }
 
-    fn line_index(&'a self, id: SourceId, given: usize) -> CodespanResult<usize> {
-        let source = World::source(self, id);
+    fn line_index(&'a self, id: FileId, given: usize) -> CodespanResult<usize> {
+        let source = self.lookup(id);
         source
             .byte_to_line(given)
             .ok_or_else(|| CodespanError::IndexTooLarge {
@@ -637,10 +921,10 @@ impl<'a> codespan_reporting::files::Files<'a> for SystemWorld {
 
     fn line_range(
         &'a self,
-        id: SourceId,
+        id: FileId,
         given: usize,
     ) -> CodespanResult<std::ops::Range<usize>> {
-        let source = World::source(self, id);
+        let source = self.lookup(id);
         source
             .line_to_range(given)
             .ok_or_else(|| CodespanError::LineTooLarge { given, max: source.len_lines() })
@@ -648,11 +932,11 @@ impl<'a> codespan_reporting::files::Files<'a> for SystemWorld {
 
     fn column_number(
         &'a self,
-        id: SourceId,
+        id: FileId,
         _: usize,
         given: usize,
     ) -> CodespanResult<usize> {
-        let source = World::source(self, id);
+        let source = self.lookup(id);
         source.byte_to_column(given).ok_or_else(|| {
             let max = source.len_bytes();
             if given <= max {
@@ -692,7 +976,7 @@ impl FontSearcher {
     #[cfg(feature = "embed-fonts")]
     fn search_embedded(&mut self) {
         let mut search = |bytes: &'static [u8]| {
-            let buffer = Buffer::from_static(bytes);
+            let buffer = Bytes::from_static(bytes);
             for (i, font) in Font::iter(buffer).enumerate() {
                 self.book.push(font.info().clone());
                 self.fonts.push(FontSlot {
@@ -702,7 +986,6 @@ impl FontSearcher {
                 });
             }
         };
-
         // Embed default fonts.
         search(include_bytes!("../assets/fonts/LinLibertine_R.ttf"));
         search(include_bytes!("../assets/fonts/LinLibertine_RB.ttf"));
@@ -721,42 +1004,33 @@ impl FontSearcher {
     }
 
     /// Search for fonts in the linux system font directories.
-    #[cfg(all(unix, not(target_os = "macos")))]
     fn search_system(&mut self) {
-        self.search_dir("/usr/share/fonts");
-        self.search_dir("/usr/local/share/fonts");
+        if cfg!(target_os = "macos") {
+            self.search_dir("/Library/Fonts");
+            self.search_dir("/Network/Library/Fonts");
+            self.search_dir("/System/Library/Fonts");
+        } else if cfg!(unix) {
+            self.search_dir("/usr/share/fonts");
+            self.search_dir("/usr/local/share/fonts");
+        } else if cfg!(windows) {
+            self.search_dir(
+                env::var_os("WINDIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| "C:\\Windows".into())
+                    .join("Fonts"),
+            );
+
+            if let Some(roaming) = dirs::config_dir() {
+                self.search_dir(roaming.join("Microsoft\\Windows\\Fonts"));
+            }
+
+            if let Some(local) = dirs::cache_dir() {
+                self.search_dir(local.join("Microsoft\\Windows\\Fonts"));
+            }
+        }
 
         if let Some(dir) = dirs::font_dir() {
             self.search_dir(dir);
-        }
-    }
-
-    /// Search for fonts in the macOS system font directories.
-    #[cfg(target_os = "macos")]
-    fn search_system(&mut self) {
-        self.search_dir("/Library/Fonts");
-        self.search_dir("/Network/Library/Fonts");
-        self.search_dir("/System/Library/Fonts");
-
-        if let Some(dir) = dirs::font_dir() {
-            self.search_dir(dir);
-        }
-    }
-
-    /// Search for fonts in the Windows system font directories.
-    #[cfg(windows)]
-    fn search_system(&mut self) {
-        let windir =
-            std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
-
-        self.search_dir(Path::new(&windir).join("Fonts"));
-
-        if let Some(roaming) = dirs::config_dir() {
-            self.search_dir(roaming.join("Microsoft\\Windows\\Fonts"));
-        }
-
-        if let Some(local) = dirs::cache_dir() {
-            self.search_dir(local.join("Microsoft\\Windows\\Fonts"));
         }
     }
 

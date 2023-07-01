@@ -12,8 +12,7 @@ use tempfile::TempDir;
 use typst::diag::SourceError;
 use typst::World;
 
-const REGEX_PATTERN_TIKZ: &str =
-    r"(?P<environment>tikzpicture|tikzcd)\[(?<block>\s*```(?P<tex_code>(?s).*?)```\s*)\]";
+const REGEX_PATTERN_TIKZ: &str = r"(?P<environment>tikzpicture|tikzcd)\[(?P<block>\s*```(?P<tex_code>(?s).*?)```\s*)\]";
 
 const LATEX_ENGINE: &str = "lualatex";
 const LATEX_DOCUMENT_BEGIN: &str = concat!(
@@ -173,9 +172,9 @@ impl Tikz {
             return None;
         }
 
-        let range = error.range(world);
-        let source = world.source(error.span.source()).text();
-        let filename = source[range.start + 1..range.end - 1].to_string();
+        let range = error.span.range(world);
+        let source = world.source(error.span.id()).unwrap();
+        let filename = source.text()[range.start + 1..range.end - 1].to_string();
 
         Tikz::is_filename(&filename)
     }
