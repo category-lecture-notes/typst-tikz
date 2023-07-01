@@ -788,17 +788,16 @@ fn prepare_package(root: &PathBuf, spec: &PackageSpec) -> PackageResult<PathBuf>
     let subdir = format!("{}/{}-{}", spec.namespace, spec.name, spec.version);
 
     if spec.namespace == "vendor" {
-        use gix_discover::repository::Path::WorkTree;
+        let mut current = root.clone();
 
-        let Ok((WorkTree(path), _)) = gix_discover::upwards(root) else {
-            return Err(PackageError::NotFound(spec.clone()));
-        };
-
-        let dir = path.join(&subdir);
-        if dir.exists() {
-            return Ok(dir);
+        while !(current.join(&subdir).exists()) {
+            if !(current.pop()) {
+                return Err(PackageError::NotFound(spec.clone()));
+            }
         }
-        return Err(PackageError::NotFound(spec.clone()));
+
+        current.push(&subdir);
+        return Ok(current);
     }
 
     let subdir = format!("typst/packages/{}", subdir);
